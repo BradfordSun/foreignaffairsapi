@@ -1,0 +1,5 @@
+fastapi==0.110.2
+openpyxl==3.0.10
+PyMySQL==1.1.0
+uvicorn[standard]
+python-multipart
