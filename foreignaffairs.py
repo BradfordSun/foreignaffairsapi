@@ -24,17 +24,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# 数据库连接函数
-# def get_db_connection():
-#     connection = pymysql.connect(host=os.getenv("dbhost"),
-#                                  user=os.getenv("dbuser"),
-#                                  password=os.getenv("dbpassword"),
-#                                  database=os.getenv("dbname"),
-#                                  charset='utf8mb4',
-#                                  cursorclass=pymysql.cursors.DictCursor)
-#     return connection
-
 def get_db_connection():
     connection = pymysql.connect(host=os.getenv("dbhost"),
                                  user=os.getenv("dbuser"),
