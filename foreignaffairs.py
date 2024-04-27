@@ -26,6 +26,15 @@ app.add_middleware(
 
 
 # 数据库连接函数
+# def get_db_connection():
+#     connection = pymysql.connect(host=os.getenv("dbhost"),
+#                                  user=os.getenv("dbuser"),
+#                                  password=os.getenv("dbpassword"),
+#                                  database=os.getenv("dbname"),
+#                                  charset='utf8mb4',
+#                                  cursorclass=pymysql.cursors.DictCursor)
+#     return connection
+
 def get_db_connection():
     connection = pymysql.connect(host=os.getenv("dbhost"),
                                  user=os.getenv("dbuser"),
@@ -34,7 +43,6 @@ def get_db_connection():
                                  charset='utf8mb4',
                                  cursorclass=pymysql.cursors.DictCursor)
     return connection
-
 
 def timecompare(timelist):
     # 如果列表为空，表示没有护照信息
@@ -90,6 +98,88 @@ def file_update():
         if connection:
             connection.close()
     return {"passportupdate":passportupdate, "workupdate":workupdate, "basicupdate":basicupdate, "baseupdate":baseupdate}
+
+@app.get("/expire")
+def expire_date():
+    expire_items = []
+    connection = None
+    try:
+        connection = get_db_connection()
+        with connection.cursor() as cursor:
+            # 获取每个人的最晚出国时间和最晚回国时间
+            cursor.execute("""
+                SELECT name,
+                       MAX(departure_date) AS max_departure_date,
+                       MAX(return_date) AS max_return_date
+                FROM base
+                GROUP BY name
+            """)
+            people = cursor.fetchall()
+
+            # 检查每个人是否仍在海外
+            for person in people:
+                # 设置默认时间为1900-01-01，以免后面报错
+                default_date = datetime.datetime.strptime('1900-01-01', '%Y-%m-%d').date()
+                # 定义最晚的出国和回国日期
+                max_departure = person['max_departure_date'] if person[
+                                                                    'max_departure_date'] is not None else default_date
+                max_return = person['max_return_date'] if person['max_return_date'] is not None else default_date
+
+                if max_departure > max_return:
+                    # 获取这个人入境时间最晚的记录的国家
+                    cursor.execute("""
+                        SELECT country
+                        FROM base
+                        WHERE name = %s AND entry_date = (
+                            SELECT MAX(entry_date)
+                            FROM base
+                            WHERE name = %s
+                        )
+                    """, (person['name'], person['name']))
+                    latest_country = cursor.fetchone()
+                    if latest_country:
+                        country = latest_country['country']
+                        # 查询这个人的批件情况
+                        cursor.execute("""
+                                                    SELECT MAX(back_date) AS last_back_date
+                                                    FROM external
+                                                    WHERE name = %s AND country = %s
+                                                """, (person['name'], country))
+                        permission = cursor.fetchone()
+                        today = datetime.datetime.now().date()
+                        if permission and permission['last_back_date']:
+                            # 查询这个人的部门情况
+                            cursor.execute("""
+                                                    SELECT department
+                                                    FROM basic
+                                                    WHERE name = %s
+                                                """, (person['name'],))
+                            department_info = cursor.fetchone()
+                            department = department_info['department'] if department_info else '未知部门'
+                            # 找到这个国家的最后批件日期
+                            last_back_date = permission['last_back_date']
+                            if last_back_date < today:
+                                status = f"{last_back_date} (已过期)"
+                            elif (last_back_date - today).days < 60:
+                                status = f"{last_back_date} (即将过期)"
+                            else:
+                                # 批件有效期内且离过期时间大于60天就不管
+                                continue
+                        else:
+                            status = "无批件"
+                        expire_items.append({
+                            'Name': person['name'],
+                            'Department':department,
+                            'Country': country,
+                            'PermissionStatus': status
+                        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if connection:
+            connection.close()
+    return {"expire":expire_items}
+
 
 # 获取护照台账和批件信息API
 @app.get("/personal")
@@ -237,11 +327,11 @@ async def upload_file(file: UploadFile = File(...)):
         await asyncio.sleep(1)
         await store_work_data(work_data)
         await update_progress_data(100, "", 'success', "处理成功，所有数据已入库。")
-    if filename.startswith("常驻"):
+    if filename == "常驻.xlsx":
         base_data = await parse_base_excel(temp_file_path)
         await update_progress_data(60, "数据入库", '', "")
         await asyncio.sleep(1)
-        await store_base_data(temp_file_path, base_data)
+        await store_base_data(base_data)
         await update_progress_data(100, "", 'success', "处理成功，所有数据已入库。")
 
 
@@ -430,42 +520,24 @@ async def store_work_data(work_data):
             connection.close()
     await asyncio.sleep(2)
 
-
 async def parse_base_excel(file_path):
     base_data = []
     try:
         workbook = load_workbook(filename=file_path)
-        # 提取出文件名中的年份
-        year = file_path.split('-')[1].split('.')[0]
-        sheet = workbook[year]
-
-        def get_cell_value_or_default(row, col, default="1900-01-01"):
-            value = sheet.cell(row=row, column=col).value
-            return value if value else default
+        sheet = workbook["常驻"]
 
         # 从第三行开始
         for i, row in enumerate(sheet.iter_rows(min_row=3, values_only=True), start=3):
             if row[2] is None:
-                # 这里第三列是姓名，和其他的不一样
-                continue
+                # 这里第三列是姓名，和其他的不一样。如果姓名为空，就抛异常
+                raise ValueError(f"第{i}行的数据不完整，姓名缺失。")
             name = row[2]
-            # 我们可以通过循环月份和相关列来简化代码
-            base_info = {"name": name}
-            for j, month in enumerate(
-                    ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'], start=1):
-                # 这样确保第一个月的国家从第五列开始，以此类推
-                country_col = 6 + (j - 1) * 6
-                duration_col = country_col + 1
-                leave_date_col = country_col + 2
-                back_date_col = country_col + 3
-                departure_date_col = country_col + 4
-                arrival_date_col = country_col + 5
-                base_info[f'country_{month}'] = sheet.cell(row=i, column=country_col).value
-                base_info[f'duration_{month}'] = sheet.cell(row=i, column=duration_col).value
-                base_info[f'leave_date_{month}'] = get_cell_value_or_default(i, leave_date_col)
-                base_info[f'back_date_{month}'] = get_cell_value_or_default(i, back_date_col)
-                base_info[f'departure_date_{month}'] = get_cell_value_or_default(i, departure_date_col)
-                base_info[f'arrival_date_{month}'] = get_cell_value_or_default(i, arrival_date_col)
+            country = row[4]
+            departure_date = row[5]
+            return_date = row[6]
+            entry_date = row[7]
+            exit_date = row[8]
+            base_info = {"name": name, "country":country, "departure_date":departure_date, "return_date":return_date, "entry_date":entry_date, "exit_date":exit_date}
             base_data.append(base_info)
     except Exception as e:
         await update_progress_data(100, "", 'error', f"解析文件失败，报错详情为：{str(e)}")
@@ -473,22 +545,16 @@ async def parse_base_excel(file_path):
     return base_data
 
 
-async def store_base_data(file_path, base_data):
+async def store_base_data(base_data):
     connection = None
     try:
-        year = file_path.split('-')[1].split('.')[0]
-        table_name = f"resident{year}"
         connection = get_db_connection()
         with connection.cursor() as cursor:
-            cursor.execute(f"DELETE FROM {table_name}")
+            cursor.execute(f"DELETE FROM base")
             for b in base_data:
-                keys = b.keys()
-                values = b.values()
-                # 下面两条其实可以拿base_data[0]的数据之后在for循环之外计算，不过无所谓了
-                columns = ', '.join(keys)
-                placeholders = ', '.join(['%s'] * len(keys))
-                cursor.execute(
-                    f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})", list(values))
+                cursor.execute("INSERT INTO base (name,country,departure_date,return_date,entry_date,exit_date)" 
+                               "VALUES (%s, %s, %s, %s, %s, %s)",
+                               (b["name"], b["country"], b["departure_date"], b["return_date"], b["entry_date"], b["exit_date"]))
             cursor.execute("UPDATE fileupdate SET baseupdate = NOW() WHERE id = 1;")
             connection.commit()
     except Exception as e:
